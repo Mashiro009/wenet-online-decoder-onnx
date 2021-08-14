@@ -110,6 +110,7 @@ class WeNetDecoder:
         # self.stride = int(self.model.encoder.embed.subsampling_rate*self.decoding_chunk_size)
         self.stride = int(subsampling_rate*self.decoding_chunk_size)
         self.sig_buffer = np.zeros(400) # signal history buffer
+        self.bytes_offline_notfinished_buffer = bytes() # offline bytes buffer for last buffer not finished signal
         self.dat_buffer = [] # maybe put feature in    feature buffer
         self.max_dat_buffer_block = 5000 # feature buffer max len
         self.chunk_size = 1600 # signal chunk size
@@ -484,14 +485,14 @@ class WeNetDecoder:
             logger.debug("Partial: %s",''.join(self.cur_result))
             self.num_decode += 1
 
-    def decoder_rescoring(self):
+    def decoder_rescoring(self,noLog=False):
         """ decoder rescoring
             we rescore the ctc output use teacher force \n
             the nbest sequence don't change, just rescore and find the new best
             we will return partial final result and final result likelihood
 
         Args:
-            Nothing
+            noLog (Bool): if true, we don't print log, default False
             
         Returns:
             Final result (string): the result after attention decoder teacher force rescoring. It is the best one
@@ -541,11 +542,12 @@ class WeNetDecoder:
             if score > best_score:
                 best_score = score
                 best_index = i
-        likelihood = hyps[best_index][1]
+        likelihood = hyps[best_index][1] if hyps[best_index][1] != None else -float("inf")
         hyps_best = hyps[best_index][0]
         content = [self.dict_model[index] for index in hyps_best]
         # print("Rescoing: "+''.join(content))
-        logger.info("Rescoing: "+''.join(content))
+        if not noLog:
+            logger.info("Rescoing: "+''.join(content))
         return ''.join(content),likelihood
 
     def endpoint(self):
@@ -1028,22 +1030,31 @@ class WeNetDecoder:
 
 
 
-    def offline_decode(self,audio_path,isbytes=False,useVad=False):
+    def offline_decode(self,audio_path,isbytes=False,useVad=False,noLog=False):
         """ offline_decode audio
             we can recieve bytes data or wav file path \n
-            we will return partial result, final result and final result likelihood
+            we will return partial result, final result and final result 
+            
+            if we use vad, we will call self.offline_decode_one_sentence one sentence by one sentence
+                and if we read a audio like Streaming long part by long part (Maybe not recommended) \n
+                we will Cut off a short sentence then we Keep the first half of the sentence and put them together when you get the second half \n
+                anyway if we want to decode for Streaming we better use a streaming model (maybe the model trained by train_unified_transformer.conf )
 
         Args:
             audio_path (string or bytes): path string or wav bytes
             isbytes (Bool): set audio_path is wav bytes or not, default False
             useVad (Bool): set we use vad or not, default False
                 The Vad tools we use is webrtcvad. See details in https://github.com/wiseman/py-webrtcvad
+            noLog (Bool): if true, we don't print log
             
         Returns:
             Partial result (string): the result after ctc prefix_beam_search
             Final result (string): the result after attention decoder teacher force rescoring. It is the best one
             Final result likelihood (float): the likelihood(score) of the Final result. 
         """
+        partial_result_list = []
+        final_result_list = []
+        final_result_likelihood = -float("inf")
         from utils.vad_ext import frame_generator,read_wave,raw_to_float,vad_collector
         if not isbytes:
             audio, sample_rate = read_wave(audio_path)
@@ -1051,25 +1062,152 @@ class WeNetDecoder:
             audio = audio_path
             sample_rate = 16000
         # print("decoder recieve {} audio bytes ".format(len(audio)))
-        logger.info("decoder recieve {} audio bytes ".format(len(audio)))
+        if not noLog:
+            logger.info("decoder recieve {} audio bytes ".format(len(audio)))
+        audio = self.bytes_offline_notfinished_buffer + audio
+        if not noLog:
+            if self.bytes_offline_notfinished_buffer != b'':
+                logger.info("after concatenate {} audio bytes ".format(len(audio)))
         if useVad:
             vad = webrtcvad.Vad(0)
-            frames = frame_generator(30, audio, 16000)
+            # frames = frame_generator(30, audio, 16000)
+            frames = frame_generator(20, audio, 16000)
             frames = list(frames)
-            segments = vad_collector(sample_rate, 30, 200, vad, frames, 0.8)
+            # segments = vad_collector(sample_rate, 30, 200, vad, frames, 0.8)
+            segments = vad_collector(sample_rate, 20, 200, vad, frames,0.6)
             signal = np.zeros(1)
             seg_num = 0
-            for seg in segments:
-                signal = np.concatenate([signal,raw_to_float(seg)]) 
+            if not noLog:
+                logger.info("use vad has {} segments".format(len(segments)))
+            for index,seg in enumerate(segments):
                 seg_num += 1
+
+                now_audio_bytes = seg[0]
+                signal = np.concatenate([signal,raw_to_float(now_audio_bytes)])
+                seg_finished = seg[3]
+                if index == len(segments) - 1:
+                    if seg_finished:
+                        partial_result, final_result, final_result_likelihood = self.offline_decode_one_sentence(signal)
+                        partial_result_list.append(partial_result)
+                        final_result_list.append(final_result)
+                        signal = np.zeros(1)
+                        self.bytes_offline_notfinished_buffer = bytes()
+                    else:
+                        self.bytes_offline_notfinished_buffer = now_audio_bytes
+                    continue
+                partial_result, final_result, final_result_likelihood = self.offline_decode_one_sentence(signal)
+                partial_result_list.append(partial_result)
+                final_result_list.append(final_result)
+                # if (index+1) % 3 == 0:
+                
+                signal = np.zeros(1)
+                
             # print("use vad has {} segments".format(seg_num))
-            logger.info("use vad has {} segments".format(seg_num))
+            if not noLog:
+                # logger.info("use vad has {} segments".format(seg_num))
+                if not seg_finished:
+                    logger.info("the last segment not finished")
         else:
             signal = raw_to_float(audio)
+            partial_result, final_result, final_result_likelihood = self.offline_decode_one_sentence(signal)
+            partial_result_list.append(partial_result)
+            final_result_list.append(final_result)
+        
+        if not noLog:
+            logger.info("final partial_result: {}".format(" ".join(partial_result_list)))
+            logger.info("final final_result: {}".format(" ".join(final_result_list)))
+        return " ".join(partial_result_list),  " ".join(final_result_list), final_result_likelihood
+        # feats = self._extract_feature(signal)
+        # feats_to_predict = torch.from_numpy(np.expand_dims(feats,0)).float()
+        
+        # y = self.get_encoder_output(feats_to_predict)
+        
+        # if self.rescoring:
+        #     self.outputs.append(y)
+        # # if self.endpoint():
+        # #     if self.rescoring:
+        # #         self.decoder_recoring()
+        # #     self.reset()
+
+        # encoder_out = y
+        # maxlen = encoder_out.size(1)
+        # # ctc_probs = self.model.ctc.log_softmax(encoder_out)
+        # ctc_probs = self.get_ctc_output(encoder_out)
+        # self.ctc_prefix_beam_search_Algorithm(ctc_probs=ctc_probs)
+        # # ctc_probs = ctc_probs.squeeze(0)
+        # # for t in range(0, maxlen):
+        # #     logp = ctc_probs[t]  # (vocab_size,)
+        # #     # key: prefix, value (pb, pnb), default value(-inf, -inf)
+        # #     next_hyps = defaultdict(lambda: (-float('inf'), -float('inf')))
+        # #     # 2.1 First beam prune: select topk best
+        # #     top_k_logp, top_k_index = logp.topk(self.beam)  # (beam_size,)
+        # #     for s in top_k_index:
+        # #         s = s.item()
+        # #         ps = logp[s].item()
+        # #         for prefix, (pb, pnb) in self.cur_hyps:
+        # #             last = prefix[-1] if len(prefix) > 0 else None
+        # #             if s == 0:  # blank
+        # #                 n_pb, n_pnb = next_hyps[prefix]
+        # #                 n_pb = log_add([n_pb, pb + ps, pnb + ps])
+        # #                 next_hyps[prefix] = (n_pb, n_pnb)
+        # #             elif s == last:
+        # #                 #  Update *ss -> *s;
+        # #                 n_pb, n_pnb = next_hyps[prefix]
+        # #                 n_pnb = log_add([n_pnb, pnb + ps])
+        # #                 next_hyps[prefix] = (n_pb, n_pnb)
+        # #                 # Update *s-s -> *ss, - is for blank
+        # #                 n_prefix = prefix + (s, )
+        # #                 n_pb, n_pnb = next_hyps[n_prefix]
+        # #                 n_pnb = log_add([n_pnb, pb + ps])
+        # #                 next_hyps[n_prefix] = (n_pb, n_pnb)
+        # #             else:
+        # #                 n_prefix = prefix + (s, )
+        # #                 n_pb, n_pnb = next_hyps[n_prefix]
+        # #                 n_pnb = log_add([n_pnb, pb + ps, pnb + ps])
+        # #                 next_hyps[n_prefix] = (n_pb, n_pnb)
+
+        # #     # 2.2 Second beam prune
+        # #     next_hyps = sorted(next_hyps.items(),
+        # #                     key=lambda x: log_add(list(x[1])),
+        # #                     reverse=True)
+        # #     self.cur_hyps = next_hyps[:self.beam]
+        # hyps = [(y[0], log_add([y[1][0], y[1][1]])) for y in self.cur_hyps]
+        # hyps = hyps[0][0]
+        # content = [self.dict_model[index] for index in hyps]
+        # #print("content:",content)
+        # # if ''.join(content) == '':
+        # #     continue
+        # # print('Partial:'+''.join(content))
+        # if not noLog:
+        #     logger.info('Partial:'+''.join(content))
+        # if self.rescoring:
+        #     final_result, final_result_likelihood = self.decoder_rescoring(noLog=noLog)
+        # self.reset()
+        # return ''.join(content) , final_result, final_result_likelihood
+
+    def offline_decode_one_sentence(self,signal,noLog=False):
+        """ offline_decode audio
+            we can recieve one short sentence signal \n
+            the signal is one segment after vad
+            we will return partial result, final result and final result likelihood
+
+            TODO 现在这个函数不能记住以前的信息，有时候是合理的，有时候是不合理
+
+        Args:
+            audio_path (string or bytes): path string or wav bytes
+            noLog (Bool): if true, we don't print log
+            
+        Returns:
+            Partial result (string): the result after ctc prefix_beam_search
+            Final result (string): the result after attention decoder teacher force rescoring. It is the best one
+            Final result likelihood (float): the likelihood(score) of the Final result. 
+        """
         feats = self._extract_feature(signal)
         feats_to_predict = torch.from_numpy(np.expand_dims(feats,0)).float()
         
         y = self.get_encoder_output(feats_to_predict)
+
+        self.keep_cache_size_moderate()
         
         if self.rescoring:
             self.outputs.append(y)
@@ -1083,43 +1221,6 @@ class WeNetDecoder:
         # ctc_probs = self.model.ctc.log_softmax(encoder_out)
         ctc_probs = self.get_ctc_output(encoder_out)
         self.ctc_prefix_beam_search_Algorithm(ctc_probs=ctc_probs)
-        # ctc_probs = ctc_probs.squeeze(0)
-        # for t in range(0, maxlen):
-        #     logp = ctc_probs[t]  # (vocab_size,)
-        #     # key: prefix, value (pb, pnb), default value(-inf, -inf)
-        #     next_hyps = defaultdict(lambda: (-float('inf'), -float('inf')))
-        #     # 2.1 First beam prune: select topk best
-        #     top_k_logp, top_k_index = logp.topk(self.beam)  # (beam_size,)
-        #     for s in top_k_index:
-        #         s = s.item()
-        #         ps = logp[s].item()
-        #         for prefix, (pb, pnb) in self.cur_hyps:
-        #             last = prefix[-1] if len(prefix) > 0 else None
-        #             if s == 0:  # blank
-        #                 n_pb, n_pnb = next_hyps[prefix]
-        #                 n_pb = log_add([n_pb, pb + ps, pnb + ps])
-        #                 next_hyps[prefix] = (n_pb, n_pnb)
-        #             elif s == last:
-        #                 #  Update *ss -> *s;
-        #                 n_pb, n_pnb = next_hyps[prefix]
-        #                 n_pnb = log_add([n_pnb, pnb + ps])
-        #                 next_hyps[prefix] = (n_pb, n_pnb)
-        #                 # Update *s-s -> *ss, - is for blank
-        #                 n_prefix = prefix + (s, )
-        #                 n_pb, n_pnb = next_hyps[n_prefix]
-        #                 n_pnb = log_add([n_pnb, pb + ps])
-        #                 next_hyps[n_prefix] = (n_pb, n_pnb)
-        #             else:
-        #                 n_prefix = prefix + (s, )
-        #                 n_pb, n_pnb = next_hyps[n_prefix]
-        #                 n_pnb = log_add([n_pnb, pb + ps, pnb + ps])
-        #                 next_hyps[n_prefix] = (n_pb, n_pnb)
-
-        #     # 2.2 Second beam prune
-        #     next_hyps = sorted(next_hyps.items(),
-        #                     key=lambda x: log_add(list(x[1])),
-        #                     reverse=True)
-        #     self.cur_hyps = next_hyps[:self.beam]
         hyps = [(y[0], log_add([y[1][0], y[1][1]])) for y in self.cur_hyps]
         hyps = hyps[0][0]
         content = [self.dict_model[index] for index in hyps]
@@ -1127,10 +1228,14 @@ class WeNetDecoder:
         # if ''.join(content) == '':
         #     continue
         # print('Partial:'+''.join(content))
-        logger.info('Partial:'+''.join(content))
+        if not noLog:
+            logger.info('Partial:'+''.join(content))
         if self.rescoring:
-            final_result, final_result_likelihood = self.decoder_rescoring()
+            final_result, final_result_likelihood = self.decoder_rescoring(noLog=noLog)
         self.reset()
+        partial_result = ''.join(content) if ''.join(content) != '' else ''
+        if partial_result == '':
+            final_result = ''
         return ''.join(content) , final_result, final_result_likelihood
 
     def ctc_prefix_beam_search_Algorithm(self,ctc_probs):
@@ -1184,9 +1289,51 @@ class WeNetDecoder:
             self.cur_hyps = next_hyps[:self.beam]
 
 
-    
+    def offline_decode_wavscp(self,wavscp_path,result_file_path,rtf_file_path,useVad=False):
+        """ offline_decode wav.scp
+            we recieve a wav.scp and decode them all
+            write result_file and rtf_file
 
+        Args:
+            wavscp_path (string): wav.scp path string 
+            result_file_path (string): output text in this path
+            rtf_file_path (string): output real time factor in this path
+            useVad (Bool): set we use vad or not, default False
+                The Vad tools we use is webrtcvad. See details in https://github.com/wiseman/py-webrtcvad
+            
+        Returns:
+            Nothing
+        """
 
+        utt2wav = { line.strip().split(' ')[0]:line.strip().split(' ')[1] for line in open(wavscp_path,'r') }
+        with open(result_file_path, 'w') as fout, open(rtf_file_path, 'w') as rtfout:
+            for index, key in enumerate(utt2wav.keys()):
+                pre_time = time.time()
+                _,final_result,_ = self.offline_decode(utt2wav[key],isbytes=False,useVad=useVad,noLog=True)
+                end_time = time.time()
+                process_time = end_time - pre_time
+                logger.info('{} {}'.format(key, final_result))
+                logger.info('{} precess {} seconds'.format(key, str(process_time)))
+                fout.write('{} {}\n'.format(key, final_result))
+                rtfout.write('{} {}\n'.format(key, str(process_time)))
+            
+
+    def resetAll(self):
+        """ resetAll
+            we reset self.bytes_offline_notfinished_buffer and call self.reset \n
+            reset self.bytes_offline_notfinished_buffer means we recieve all the bytes from a long audio file
+
+        Args:
+            Nothing
+            
+        Returns:
+            Nothing
+        """
+        self.bytes_offline_notfinished_buffer = bytes()
+        self.reset()
+        pass
+
+    # def 
 
 
 if __name__ == '__main__':
@@ -1195,12 +1342,33 @@ if __name__ == '__main__':
     # weNetDecoder = WeNetDecoder('exp/unified_transformer/model.yaml')
     # weNetDecoder = WeNetDecoder('exp/unified_conformer/onnx_model/model_onnx.yaml')
     # weNetDecoder = WeNetDecoder('exp/conformer/onnx_model/model_onnx.yaml')
-    weNetDecoder = WeNetDecoder('model_onnx_template.yaml')
+    weNetDecoder = WeNetDecoder('20210204_conformer_exp/onnx_model/model_onnx.yaml')
+    # weNetDecoder = WeNetDecoder('model_onnx_template.yaml')
+    # weNetDecoder.offline_decode('./long_sil.wav',useVad=False)
+    # weNetDecoder.resetAll()
     # weNetDecoder.offline_decode('./long_sil.wav',useVad=True)
+    # # weNetDecoder.resetAll()
+
+    # weNetDecoder.offline_decode('./1-car.wav',useVad=True)
+    # weNetDecoder.resetAll()
+
+    # with open('./1-car.wav','rb') as audiostream:
+    #     audiostream.read(44)
+    #     for dataflow in tqdm(iter(lambda:audiostream.read(32000 * 20),"")):
+    #         if len(dataflow) == 0:
+    #             break
+    #         weNetDecoder.offline_decode(dataflow,isbytes=True,useVad=True)
+    #         time.sleep(0.1)
+    # weNetDecoder.resetAll()
+
+
     # weNetDecoder.offline_decode('./long_sil.wav',useVad=False)
     
-    weNetDecoder.offline_decode('./BAC009S0764W0121.wav')
+    weNetDecoder.offline_decode('./BAC009S0764W0121.wav',useVad=True)
+    weNetDecoder.resetAll()
     
+    weNetDecoder = WeNetDecoder('20210204_unified_transformer_exp/onnx_model/model_onnx.yaml')
+
     with open('./BAC009S0764W0121.wav','rb') as audiostream:
     # with open('./long_sil.wav','rb') as audiostream:
         audiostream.read(44)
@@ -1216,4 +1384,4 @@ if __name__ == '__main__':
             time.sleep(0.1)
     # weNetDecoder.ctc_prefix_beam_search_purn_all()
     weNetDecoder.decoder_rescoring()
-    pass
+    # pass
