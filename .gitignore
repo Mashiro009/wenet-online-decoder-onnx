@@ -34,9 +34,11 @@ __pycache__/
 exp
 data
 raw_wav
-onnx_model
+# onnx_model
 tensorboard
 **/*build*
 long_sil.wav
 1-car.wav
 decode_for_rtf_test.sh
+*.onnx
+*.zip

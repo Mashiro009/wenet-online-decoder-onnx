@@ -1,0 +1,35 @@
+collate_conf:
+  sample_rate: 16000
+  feature_extraction_conf:
+    feature_type: fbank
+    frame_length: 25
+    frame_shift: 10
+    mel_bins: 80
+    using_pitch: false
+
+encoder: conformer
+encoder_conf:
+  input_layer: conv2d
+
+model_conf:
+  ctc_weight: 0.3
+
+
+output_dim: 4233
+
+# decode_mode
+decode_mode: ctc_prefix_beam_search
+beam: 19
+
+# dict
+dict: 20210204_conformer_exp/words.txt
+
+# gpu
+# gpu: 0,1
+
+# rescoring or not
+rescoring: true
+
+# onnx dir
+onnx_dir: 20210204_conformer_exp/onnx_model
+# onnx_model文件下需要 encoder_chunk.onnx decoder.onnx ctc.onnnx
