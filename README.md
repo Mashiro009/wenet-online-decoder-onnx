@@ -7,6 +7,16 @@
 * decoder.onnx
 * ctc.onnnx
 
+已准备了两个模型分别在20210204_conformer_exp和20210204_unified_transformer_exp中，可以直接进行测试，详细内容见各自的readme文件,
+
+因无法上传100MB以上的文件到github上,请前去[CSDN链接](https://download.csdn.net/download/MashiroRin/21094226)进行下载
+
+或百度云(删除链接中 中文后 访问)：
+链接：https://pan盘.baidu百度.com/s/139mycaFN3JHNoY0xCHLjxw 
+提取码：k3gk
+
+或在issues中留下邮箱,发送该zip文件
+
 ## 环境配置
 
 torch、CUDA版本以及其他python包安装，参考wenet官方文档：https://github.com/mobvoi/wenet
@@ -22,3 +32,8 @@ torch、CUDA版本以及其他python包安装，参考wenet官方文档：https:
 ## 参考
 
 本代码参考[wenet_onlinedecode](https://github.com/jiay7/wenet_onlinedecode)进行修改
+
+## 21.8.14更新
+
+* 准备了两个模型,分别为离线conformer和在线transformer
+* 修改了对长音频的离线解码方式,使用vad来一句一句进行解码（代码不一定完善
